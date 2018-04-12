@@ -18,6 +18,7 @@ import copy
 import json
 import metrics
 import urllib
+import requests
 from common import *
 from datetime import datetime
 from distutils.util import strtobool
@@ -126,6 +127,31 @@ def sns_scan_results(s3_object, result):
         MessageStructure="json"
     )
 
+def slack_scan_results(s3_object, result, output):
+    if AV_STATUS_SLACK_URL is None:
+        return
+    message = {
+        "bucket": s3_object.bucket_name,
+        "key": s3_object.key,
+        "version": s3_object.version_id,
+        AV_STATUS_METADATA: result,
+        AV_TIMESTAMP_METADATA: datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S UTC"),
+        "output": output,
+    }
+    slack_data = {
+        'text': json.dumps(message),
+        'channel':'#security-test'
+    }
+    # transmit the message to the proper Slack channel
+    response = requests.post(
+        AV_STATUS_SLACK_URL, data=json.dumps(slack_data),
+        headers={'Content-Type': 'application/json'}
+    )
+    if response.status_code != 200:
+        raise ValueError(
+            'Request to slack returned an error %s, the response is:\n%s'
+            % (response.status_code, response.text)
+        )
 
 def lambda_handler(event, context):
     start_time = datetime.utcnow()
@@ -136,12 +162,13 @@ def lambda_handler(event, context):
     sns_start_scan(s3_object)
     file_path = download_s3_object(s3_object, "/tmp")
     clamav.update_defs_from_s3(AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX)
-    scan_result = clamav.scan_file(file_path)
+    scan_result, scan_output = clamav.scan_file(file_path)
     print("Scan of s3://%s resulted in %s\n" % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result))
     if "AV_UPDATE_METADATA" in os.environ:
         set_av_metadata(s3_object, scan_result)
     set_av_tags(s3_object, scan_result)
     sns_scan_results(s3_object, scan_result)
+    slack_scan_results(s3_object, scan_result, scan_output)
     metrics.send(env=ENV, bucket=s3_object.bucket_name, key=s3_object.key, status=scan_result)
     # Delete downloaded file to free up room on re-usable lambda function container
     try:
